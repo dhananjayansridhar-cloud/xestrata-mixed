@@ -1,0 +1,25 @@
+# not versioned here
+xestrata/
+intel-llvm/
+device-libs/
+.venv/
+logs/
+env.cmd
+config/xestrata-mixed.json
+smoke/*.exe
+*.bak*
+*.tmp
+# local, machine-specific helpers kept out of the shareable repo
+agents/
+STATE.md
+TASK.md
+run_configure.bat
+xestrata-mixed.json*
+scripts/*.sh
+scripts/configure.cmd
+scripts/build.cmd
+scripts/devlibs.cmd
+scripts/rt.cmd
+scripts/smoke.cmd
+scripts/xctx.cmd
+scripts/xs_*.cmd*
