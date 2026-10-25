@@ -50,7 +50,8 @@
     "ONEAPI_DEVICE_SELECTOR": "hip:0;cuda:0",
     "STRATA_RESIDENT_PIN": "0",
     "ROCM_PATH": "<ROCm short path>",
-    "CUDA_PATH": "<CUDA short path>"
+    "CUDA_PATH": "<CUDA short path>",
+    "STRATA_VERIFY_ASYNC_LAUNCH": "0"
   },
   "reasoning_effort": "low"
 }

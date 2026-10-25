@@ -9,8 +9,9 @@ It contains build scripts, a server configuration template, a memory guard and t
 the most time to find. It does **not** contain the engine, the compiler or any model: those are
 separate projects with their own licenses.
 
-> Status: it works and is fast, but it is **not fully stable yet** (see [Known issues](#known-issues)).
-> Treat it as a tested recipe, not a finished product.
+> Status: it works and is fast. A crash that hit every few minutes under agent load is gone in our tests with one environment
+> variable (`STRATA_VERIFY_ASYNC_LAUNCH=0`, see [The stability finding](#the-stability-finding)). That result is from 15-minute test runs
+> plus several hours of real use, not from a long soak test, so treat it as a tested recipe, not a finished product.
 
 ## Why bother
 
@@ -93,8 +94,10 @@ All steps are scripts in `scripts\`, run in order. Each one prints an `EXIT CODE
    the limit, or available RAM under a threshold for a sustained time). A guard on "available RAM
    under 1 GB" is wrong for this engine: mapped model pages make that normal, and it killed healthy
    servers during large prompts.
-7. **Log file for monitoring.** Keep the server's console output in a file; tools that show live
-   tokens-per-second read it. Starting the server without redirecting its output hides live speed.
+7. **Log file for monitoring.** Keep the server's console output in a file (`>> serve.log 2>&1` in the cmd file); tools that show
+   live tokens-per-second read it. Starting the server without redirecting its output hides live speed. In our setup a server started
+   from a detached process with no console wrote nothing to the redirected log, while the same cmd file started from a normal
+   shell did; check that the file grows while the model answers.
 
 ## Settings that mattered for stability and speed
 
@@ -105,20 +108,43 @@ All steps are scripts in `scripts\`, run in order. Each one prints an `EXIT CODE
 | `--spec` | 4 | draft acceptance was about 73 percent |
 | `--kv` | `k8v4` | fits a 131k window |
 | `reasoning_effort` | `low` in the server config | meant to cut thinking time; we could not measure a clear gain |
-| two optional engine flags tried for the crash (`STRATA_MTP_STAGE0=1`, `STRATA_SH_STREAM=0`) | off | no stability benefit; the second cost about 30 percent speed |
+| `STRATA_VERIFY_ASYNC_LAUNCH` (environment) | `0` | **the stability fix**: window graphs are launched from the calling thread instead of a helper thread (see below) |
+| two other engine flags tried for the crash (`STRATA_MTP_STAGE0=1`, `STRATA_SH_STREAM=0`) | off | no stability benefit; the second cost about 30 percent speed |
 
-## Known issues
+## The stability finding
 
-- **Intermittent engine failure in long agent sessions**: `verify: layer N never rang`, a CUDA
-  invalid-context abort, or a GPU wait that exceeds the hang limit, usually while reading a large
-  prompt. In our runs it hit about every 15 to 30 minutes of agent work and about 1 in 4 cold large
-  prompts at the larger chunk sizes. After a crash the first request fails and the engine reloads
-  in 1 to 3 minutes. The same message has been reported upstream on single-vendor multi-GPU setups
-  (Strata issue 3813), so it is probably not caused by mixing vendors.
-- Workaround we use: a supervisor script that wakes the engine with a one-word request and retries the
-  agent's turn. If you automate long jobs, do the same.
-- Our port is based on Strata 0.1.45. Newer upstream engines (0.1.48 and later) contain verify-path
-  fixes that we have not merged yet.
+Symptom: in long agent sessions the engine died with `verify: layer N never rang (graph finished)`, a CUDA invalid-context abort, or a GPU wait
+that exceeded the hang limit, usually while a large prompt was being read; the next request after a crash also failed while the engine reloaded
+(1 to 3 minutes). The same message is reported upstream on single-vendor multi-GPU setups (Strata issue 3813), so mixing vendors is probably
+not the cause.
+
+How we found a fix: `test/longsession.cjs` replays an agent-like session against the server (conversations that grow 1 to 4k tokens a turn up to
+about 100k tokens, then restart cold) and counts engine failures; each configuration gets a freshly started server and 15 minutes.
+
+| configuration | engine failures in 15 min | requests completed | decode tok/s (median) |
+|---|---|---|---|
+| unchanged (baseline) | 4 | about 45 | 115 |
+| `STRATA_VERIFY_ASYNC_LAUNCH=0` | **0** | 103 | 119 |
+| `STRATA_VERIFY_SEGMENTED=1` (windows run as segments) | 0 | 81 | 85 (slower) |
+| `STRATA_DF_BRANCH=0` and `STRATA_FETCH_BRANCH=0` | 0 | 101 | 123 |
+| `STRATA_VERIFY_RESIDENT_GRAPH=0` | 4 | about 60 | not measured |
+| unchanged, repeated | 3 | 14 | not measured |
+
+The baseline failed in every run (three runs), and three variants ran clean. We use `STRATA_VERIFY_ASYNC_LAUNCH=0`: it costs no decode speed and
+prompt reading drops by about 8 percent (about 680 against 740 tok/s). Caveats: 15 minutes per setting and one run each is a small sample; we do not know
+the exact failure mechanism, only that the helper-thread launch path is involved; run `test/longsession.cjs` yourself for an hour before trusting it.
+The supervisor workaround is still worth having for unattended jobs: wake the engine with a one-word request and retry the agent's turn after an error.
+
+## Notes on newer XeStrata and Strata releases
+
+- The port we built from is based on Strata 0.1.45. The newer Windows SYCL port (`xe0.2.2-1`, Strata 0.2.2) builds with the same toolchain, and it has no
+  helper-thread launch code at all (the path the fix above switches off), so it may fix the crash on its own. We did not adopt it: with it, prompt reading
+  was about 6 times slower (126 against about 800 tok/s) and we could not find the cause.
+- Building it natively on Windows: oneMath's rocBLAS and cuBLAS backends are only built on Unix or in a cross build, so a native Windows build silently
+  falls back to the engine's own kernels for the prompt matrix products. `patches/onemath-native-windows.md` lists the four CMake conditions that
+  need to allow native Windows (plus the cache variables to give). Even with them the prompt speed was not recovered.
+- A Strata proposal for layer-major prefill on a CUDA layer split (issue 3976) reports 1.6 to 2.3 times faster prompt reading; it is opt-in, CUDA-only
+  and not in an official build.
 
 ## Layout
 
@@ -127,6 +153,8 @@ env.example.cmd             folders and the two GPU architectures (copy to env.c
 scripts\01 ... 08           the recipe, in order
 scripts\_env.cmd            loads env.cmd, derives short paths, loads the Visual Studio environment
 scripts\guard-mem.cjs       memory guard wrapper
+test\longsession.cjs        agent-like load that counts engine failures (the crash-rate test)
+patches\onemath-native-windows.md   what to change so oneMath's GPU backends build on native Windows
 smoke\smoke_ok.cpp          two-GPU SYCL smoke test
 config\xestrata-mixed.example.json   server configuration template
 ```
