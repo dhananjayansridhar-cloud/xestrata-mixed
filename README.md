@@ -12,6 +12,13 @@ separate projects with their own licenses.
 > Status: it works and is fast. A crash that hit every few minutes under agent load is gone in our tests with one environment
 > variable (`STRATA_VERIFY_ASYNC_LAUNCH=0`, see [The stability finding](#the-stability-finding)). That result is from 15-minute test runs
 > plus several hours of real use, not from a long soak test, so treat it as a tested recipe, not a finished product.
+>
+> **2026-11-01 update:** a newer XeStrata release (`xe0.2.8-1`, Strata 0.2.8) now builds with the same toolchain and runs **faster**
+> than the 0.1.45 build above, instead of the 6x-slower regression we saw in the release between them (see
+> [Notes on newer releases](#notes-on-newer-xestrata-and-strata-releases)). `update/` has a script that tracks new releases, builds
+> and tests them automatically, and falls back if one does not run — see [Updating automatically](#updating-automatically). We also
+> found that an **uncapped GPU clock** can hard-reset the PC under two-GPU load even on a large PSU, fixed by capping it (no
+> administrator rights needed); see [The clock finding](#the-clock-finding) before you run this for long sessions.
 
 ## Why bother
 
@@ -27,6 +34,10 @@ experts' worth of data and the host RAM needs shrink:
 
 Measured with a 48 GB-class MoE model at an IQ2 quantisation, a 131,072-token window and a PC with
 32 GB of RAM, driven by a coding agent. Your numbers will differ with your cards, model and settings.
+
+With `xe0.2.8-1`, a fine-tuned draft layer for the model (see [Updating automatically](#updating-automatically)) and `--pipeline-windows 2`,
+the same kind of agent load measured a decode median of 119 to 140 tok/s depending on the GPU clock setting (see
+[The clock finding](#the-clock-finding)), peaking above 200 tok/s on repetitive output (code edits, quoted text).
 
 The point of the mixed build is that the stock Windows engines are single-vendor: one is built for
 HIP (AMD) and one for CUDA (NVIDIA), and neither can use both cards. Building the engine with the
@@ -138,13 +149,72 @@ The supervisor workaround is still worth having for unattended jobs: wake the en
 ## Notes on newer XeStrata and Strata releases
 
 - The port we built from is based on Strata 0.1.45. The newer Windows SYCL port (`xe0.2.2-1`, Strata 0.2.2) builds with the same toolchain, and it has no
-  helper-thread launch code at all (the path the fix above switches off), so it may fix the crash on its own. We did not adopt it: with it, prompt reading
-  was about 6 times slower (126 against about 800 tok/s) and we could not find the cause.
+  helper-thread launch code at all (the path the fix above switches off), so it may fix the crash on its own. We did not adopt it at the time: with it,
+  prompt reading was about 6 times slower (126 against about 800 tok/s) and we could not find the cause.
 - Building it natively on Windows: oneMath's rocBLAS and cuBLAS backends are only built on Unix or in a cross build, so a native Windows build silently
   falls back to the engine's own kernels for the prompt matrix products. `patches/onemath-native-windows.md` lists the four CMake conditions that
   need to allow native Windows (plus the cache variables to give). Even with them the prompt speed was not recovered.
 - A Strata proposal for layer-major prefill on a CUDA layer split (issue 3976) reports 1.6 to 2.3 times faster prompt reading; it is opt-in, CUDA-only
   and not in an official build.
+- **2026-11-01: a later release, `xe0.2.8-1` (Strata 0.2.8), builds and runs correctly** with the same mixed toolchain, and the earlier 6x prompt-speed
+  regression is gone — it is now *faster* than our 0.1.45 baseline once tuned (see the results table at the top). We applied the Strata 0.2.9 server-side
+  fixes by hand as a patch (`patches/serve-0.2.9-fixes.patch`: tool calls inside a fenced code block are no longer run, and a tool the conversation already
+  used still counts as declared on a later turn) since the port had not reached 0.2.9 at the time. `update/strata-multi.ps1` tracks new XeStrata releases,
+  builds and tests each one automatically against the mixed toolchain, and keeps it or falls back — see [Updating automatically](#updating-automatically).
+- We tried a 1.2 GB DFlash2 block drafter (a separate model, not the engine's own MTP layer) for this model family. It measured **slower** than the stock
+  MTP drafter on our RX 7900 XTX in every run (15-27 tok/s against MTP's 17-28 tok/s on the same prompt), and the engine refuses `--draft dflash2` together
+  with `--serve` or a layer split anyway, so it cannot run in this mixed, multi-GPU setup. Not adopted.
+
+## Updating automatically
+
+`update\strata-multi.bat` (logic in `update\strata-multi.ps1`) checks MistVVK/XeStrata's `main` branch for a release newer than the one you last ran
+(the version is read straight from its `CMakeLists.txt`, so it reacts to a version bump, not every commit), builds it with this repo's toolchain, runs
+a test request and a short speed check, and either keeps it as the new "last working version" or reverts to the one before it and tells you why — a
+version that fails once is not retried until a newer one appears. On every start it also checks for newer NVIDIA/AMD drivers, CUDA, the ROCm HIP SDK
+and intel/llvm, and reports them (never installs); `-Rebuild` builds your current version again against newly installed toolkits, as a separate,
+tested version. `-Sessions N` serves N conversations in parallel instead of one pipelined session (see [Multi-session](#multi-session-parallel-requests)).
+
+Copy `update\launcher-settings.example.ps1` to `update\launcher-settings.ps1` and fill in your folders (the toolchain you built with this repo's own
+recipe, your Python, your GPU architectures) and the build you already have working (`$SeedVersion`), then run `update\strata-multi.bat`. State
+(which version last worked, which failed and why) lives in `state.json` next to the script; each built version gets its own folder and virtual
+environment there, so your original build in this repo is never modified.
+
+## The clock finding
+
+An **uncapped** GPU under sustained two-GPU load hard-reset our PC (Kernel-Power 41, no blue screen, no crash dump) within seconds to a few minutes,
+repeatably, even on a 1000 W Platinum PSU. Capping the AMD card's power alone only delayed it; capping its **maximum clock** (we used AMD's Overdrive8
+API directly, see `update/amd-od8.ps1`) removed the resets in every 15-minute stress test we ran afterward. A single-GPU load was stable uncapped the
+whole time, so this is specific to driving both cards at once, not a general instability.
+
+We also tried **locking** the clock (setting the *minimum* equal to the capped maximum, so the card cannot ramp down between bursts and back up on the
+next one) on the theory that the rapid ramp itself, not the peak clock, might be what stresses the power delivery path during bursty token-by-token
+decode. Locked and ceiling-only capped measured **the same speed** (140 against 138 tok/s decode median, 964 against 947 tok/s prompt reading, same
+15-minute test) at the one clock value we could compare directly, so locking costs nothing. We did not get a controlled test of locked against
+ceiling-only at a clock *known* to fail ceiling-only, so whether locking buys more headroom than capping alone is still open. If you hit the same kind
+of reset, try a clock cap first; `amd-od8.ps1 -Set "9=-10,0=<mhz>"` sets AMD's power and clock ceiling with no administrator rights needed, and
+`-Set "1=<mhz>,0=<mhz>"` locks it (setting 1 is the floor, setting 0 is the ceiling, same feature family).
+
+## Multi-session (parallel requests)
+
+The engine's `--batch N` serves several conversations at once instead of one pipelined session (`--pipeline-windows`, which it refuses together with
+`--batch`). Measured on our PC, Swift 1.5 IQ2_XS, short prompts, aggregate tok/s (total output / wall time) and per-request decode tok/s:
+
+| configuration | c=1 aggregate / per-req | c=2 aggregate / per-req | c=4 aggregate / per-req |
+|---|---|---|---|
+| one session, pipelined (no `--batch`) | 75 / 97 | 105 / 134 (queued, not parallel slots) | 99 / 149 (queued) |
+| `--batch 2 --batch-groups auto` | 48 / 57 | **crashed** | **crashed** |
+| `--batch 2 --batch-groups 1` | 47 / 55 | 79 / 46 | 71 / 46 |
+| `--batch 4 --batch-groups auto` | 34 / 39 | **crashed** | **crashed** |
+| `--batch 4 --batch-groups 1` | 35 / 40 | 68 / 41 | 66 / 22 |
+
+**`--batch-groups auto` (pipelined slot groups, no per-slot draft layer) crashed reliably the moment a second request arrived**, at both `--batch 2` and
+`--batch 4` (confirmed twice each): `verify batch: the window's commit did not finish`, engine exit code 1, auto-restart in 1 to 3 minutes. We did not
+find a condition under which it survived concurrency. **`--batch-groups 1` (one slot group, a real per-slot MTP draft layer) was clean** at every
+concurrency level we tried. If you use `--batch` on a layer split at all, set `--batch-groups 1` explicitly; do not rely on the `auto` default.
+
+Where it is worth it: aggregate throughput roughly doubles going from 1 to 2 concurrent requests under `--batch-groups 1`, at roughly half the
+per-request speed — a reasonable trade for serving two agents instead of one, poor for making a single agent faster (one pipelined session alone
+is faster per-request than any batch configuration we measured). `update/strata-multi.ps1 -Sessions N` builds this config for you.
 
 ## Layout
 
@@ -155,8 +225,13 @@ scripts\_env.cmd            loads env.cmd, derives short paths, loads the Visual
 scripts\guard-mem.cjs       memory guard wrapper
 test\longsession.cjs        agent-like load that counts engine failures (the crash-rate test)
 patches\onemath-native-windows.md   what to change so oneMath's GPU backends build on native Windows
+patches\serve-0.2.9-fixes.patch     Strata 0.2.9's server-side fixes, applied by hand to xe0.2.8-1's serve\ (see "Notes on newer releases")
 smoke\smoke_ok.cpp          two-GPU SYCL smoke test
 config\xestrata-mixed.example.json   server configuration template
+update\strata-multi.bat / .ps1   tracks new XeStrata releases, builds, tests and falls back automatically (see "Updating automatically")
+update\xu_build.cmd         configure + build one XeStrata tree with this repo's toolchain (called by strata-multi.ps1)
+update\amd-od8.ps1          set an AMD card's Overdrive8 power limit and clock cap/lock from the command line, no admin rights needed
+update\launcher-settings.example.ps1   per-PC settings for strata-multi.ps1 (copy to launcher-settings.ps1 and edit)
 ```
 
 ## License and credits
@@ -165,3 +240,7 @@ The scripts and notes in this repository are released under the MIT License. Str
 intel/llvm, ROCm and CUDA are separate projects under their own licenses; check them before you
 redistribute binaries. Thanks to the authors of Strata, of the Windows SYCL port, and of the
 intel/llvm SYCL compiler.
+
+The fine-tuned MTP draft layer mentioned in the results above is [Hardin22/Strata-DualGPU](https://github.com/Hardin22/Strata-DualGPU)'s
+`swift15-mtp-ft2`, fine-tuned for this model's own outputs with a wider draft vocabulary; it is not redistributed here and keeps the Qwen and
+Swift licenses it ships with — see that repository for the file and its terms.
